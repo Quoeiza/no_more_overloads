@@ -26,7 +26,8 @@ local INVERTED_KINDS = {
 }
 local WarpCharge = require("scripts/utilities/warp_charge")
 
--- Overload cap. Brain Rupture blocks only its lock, at the game's extreme threshold.
+-- An action overloads only when it pays at 100%. Brain Rupture blocks only its lock, at the
+-- game's extreme threshold.
 local PERIL_CAP = 0.999
 local BRAIN_RUPTURE_EXTREME = 0.97
 -- Headroom below that threshold: one fixed frame of climb.
@@ -36,12 +37,22 @@ local BRAIN_RUPTURE_HEADROOM = 0.003
 local AUTO_FIRE_MARGIN = 0.03
 -- Charge time before the fire can start (the fire's chain_time).
 local AUTO_FIRE_CHAIN_TIME = 0.5
+-- Charge actions (staffs, Smite's heavy, the plasma brace) and their fire-transition keys.
 local STAFF_CHARGE_ACTIONS = { action_charge = true, action_charge_flame = true }
--- Fire-transition keys of those charges, one per staff.
-local STAFF_FIRE_INPUTS = { "trigger_charge_flame", "trigger_explosion", "shoot_charged" }
--- Block threshold per category; the rest use PERIL_CAP.
-local CATEGORY_CAP = { force_sword = 0.96, duelling_sword = 0.96, plasma = 0.99 }
+local STAFF_FIRE_INPUTS = { "trigger_charge_flame", "trigger_explosion", "shoot_charged", "shoot_heavy_hold", "shoot_braced" }
+-- Categories whose charged fire can be queued and land later.
+local FIRE_GUARD = { staff = true, blitz = true, plasma = true }
 local OVERHEAT_CATEGORIES = { plasma = true }
+local BLITZ_VARIANT = { psyker_smite = "brain_rupture", psyker_throwing_knives = "assail" }
+-- Seconds (plus ping) for a server-only Peril payment or a spent Empowered Psionics stack to
+-- reach this client.
+local SYNC_MARGIN = 0.15
+local EMPOWERED_SETTLE = 0.35
+local EMPOWERED_BUFFS = {
+	"psyker_empowered_grenades_passive_visual_buff", "psyker_empowered_grenades_passive_visual_buff_increased",
+}
+-- A stun on the first frame of a plasma hip charge fires it: block the press this close to the cap.
+local PLASMA_HIP_MARGIN = 0.004
 
 -- Immunity counts as ended this long (plus ping) early, covering the longest cast.
 local IMMUNITY_LEAD = 1.25
@@ -72,14 +83,15 @@ local AUTO_USE_SETTING = {
 -- Raw inputs blocked at the cap. Held ones are skipped mid-charge: a forced release fires it.
 local CATEGORY_INPUTS = {
 	staff       = { pressed = { "action_one_pressed" }, held = { "action_one_hold" } },
-	blitz       = { pressed = { "action_one_pressed" }, held = { "action_one_hold", "action_two_hold" } },
-	-- Only the special overloads; melee is free.
+	-- Aiming and charging (action_two) never overload; only the fire does.
+	blitz       = { pressed = { "action_one_pressed" }, held = { "action_one_hold" } },
+	-- Only charging the sword pays Peril; swings, charged or not, are free.
 	force_sword = { pressed = { "weapon_extra_pressed" }, held = { "weapon_extra_hold" } },
 	gun         = { pressed = { "weapon_extra_pressed" }, held = { "weapon_extra_hold" } },
 	-- The parry special builds Peril.
 	duelling_sword = { pressed = { "weapon_extra_pressed" }, held = { "weapon_extra_hold" } },
-	-- Only the shot at full heat detonates.
-	plasma = { pressed = { "action_one_pressed" }, held = {} },
+	-- Only a braced shot at full heat detonates; the charged-fire guard blocks it.
+	plasma = { pressed = {}, held = {} },
 }
 -- Force-sword holds blocked during a push: adds the fling follow-up.
 local FS_HELD_PUSH = { "weapon_extra_hold", "action_one_hold" }
@@ -115,6 +127,7 @@ local VENTABLE = { staff = true, force_sword = true, blitz = true }
 local STAFF_RELEASE = { "action_one_hold", "action_two_hold" }
 
 local InputHandlerSettings = require("scripts/managers/player/player_game_states/input_handler_settings")
+local BuffTemplates = require("scripts/settings/buff/buff_templates")
 local Sprint = require("scripts/extension_systems/character_state_machine/character_states/utilities/sprint")
 
 -- Plasma vent interrupts: every press action except movement and the vent key itself.
@@ -160,6 +173,7 @@ local function refresh_settings()
 	cfg.block_staffs       = mod:get("block_staffs")
 	cfg.block_blitzes      = mod:get("block_blitzes")
 	cfg.block_force_swords = mod:get("block_force_swords")
+	cfg.block_force_greatswords = mod:get("block_force_greatswords")
 	cfg.block_guns         = mod:get("block_guns")
 	cfg.block_crystalline  = mod:get("block_crystalline")
 	cfg.block_duelling_swords = mod:get("block_duelling_swords")
@@ -194,6 +208,16 @@ local function refresh_settings()
 
 	cfg.word_unsafe = indicator_word(mod:get("unsafe_word"), "txt_unsafe")
 	cfg.word_safe = indicator_word(mod:get("safe_word"), "txt_safe")
+end
+
+-- One-time settings migration: both quell interrupts on; greatswords inherit the force-sword block.
+if (mod:get("settings_version") or 0) < 1 then
+	mod:set("auto_quell_interrupt_offensive", true)
+	mod:set("auto_quell_interrupt_other", true)
+	if mod:get("block_force_swords") == false then
+		mod:set("block_force_greatswords", false)
+	end
+	mod:set("settings_version", 1)
 end
 
 mod.on_all_mods_loaded = refresh_settings
@@ -285,7 +309,8 @@ local function get_local_unit()
 	return unit, archetype
 end
 
--- Wielded weapon's category and whether it is Brain Rupture; nil if not overload-relevant.
+-- Wielded weapon's category and variant ("brain_rupture", "assail", "greatsword" or nil).
+-- nil if not overload-relevant.
 local function classify(unit)
 	local weapon_ext = ScriptUnit.has_extension(unit, "weapon_system")
 	local template = weapon_ext and weapon_ext:weapon_template()
@@ -297,7 +322,9 @@ local function classify(unit)
 	for i = 1, #kws do
 		local k = kws[i]
 		if k == "force_staff" then return "staff" end
-		if k == "force_sword" then return "force_sword" end
+		if k == "force_sword" then
+			return "force_sword", string.find(template.name or "", "forcesword_2h", 1, true) and "greatsword" or nil
+		end
 		if k == "laspistol" then return "gun" end
 		if k == "plasma_rifle" then return "plasma" end
 		if k == "combat_sword" then combat_sword = true end
@@ -309,15 +336,18 @@ local function classify(unit)
 	end
 	-- Template psyker_smite is Brain Rupture.
 	if #kws == 1 and kws[1] == "psyker" then
-		return "blitz", template.name == "psyker_smite"
+		return "blitz", BLITZ_VARIANT[template.name]
 	end
 	return nil
 end
 
-local function block_toggle_for(category)
+local function block_toggle_for(category, greatsword)
 	if category == "staff" then return cfg.block_staffs end
 	if category == "blitz" then return cfg.block_blitzes end
-	if category == "force_sword" then return cfg.block_force_swords end
+	if category == "force_sword" then
+		if greatsword then return cfg.block_force_greatswords end
+		return cfg.block_force_swords
+	end
 	if category == "gun" then return cfg.block_guns end
 	if category == "duelling_sword" then return cfg.block_duelling_swords end
 	if category == "plasma" then return cfg.block_plasma end
@@ -410,8 +440,43 @@ local quell_replay = nil
 local quell_replay_until = 0
 -- Weapon the press was made on; a swap drops it.
 local quell_replay_template = nil
--- Last fixed frame's staff Peril, for the climb rate; false when untracked.
-local staff_prev_peril = false
+-- Last fixed frame's meter while a charge-and-fire weapon is wielded, and the fastest one-frame
+-- climb of the running charge (its start time identifies it).
+local fire_prev = false
+local fire_climb_t = false
+local fire_climb = 0
+-- Peril the running action still owes: its instance, the meter at its start, its cost, and when
+-- the meter must show it by.
+local pending = { start_t = false, base = 0, cost = 0, until_t = 0 }
+local pending_now = 0
+-- Start times of the last blitz casts that spend an Empowered Psionics stack.
+local blitz_fire_ts = {}
+
+-- Whether an Empowered Psionics stack is certainly unspent: stacks seen here, less the recent
+-- casts whose spent stack may not have reached this client yet.
+local function empowered_free(buff_ext)
+	if not (EMPOWERED_GRENADE and buff_ext:has_keyword(EMPOWERED_GRENADE)) then
+		return false
+	end
+	local settle = EMPOWERED_SETTLE + math.min(last_ping, 1)
+	local recent = 0
+	for i = 1, #blitz_fire_ts do
+		local since = last_fixed_t - blitz_fire_ts[i]
+		if since >= 0 and since <= settle then
+			recent = recent + 1
+		end
+	end
+	local stacks = 1
+	if buff_ext.current_stacks then
+		for i = 1, #EMPOWERED_BUFFS do
+			-- The buff briefly holds one stack over its cap (max_stacks - 1) when a gain overflows.
+			local buff_template = rawget(BuffTemplates, EMPOWERED_BUFFS[i])
+			local cap = buff_template and buff_template.max_stacks and buff_template.max_stacks - 1 or 1
+			stacks = math.max(stacks, math.min(buff_ext:current_stacks(EMPOWERED_BUFFS[i]) or 0, cap))
+		end
+	end
+	return stacks - recent >= 1
+end
 
 local function update_auto_ability(unit, overloading, peril, dt)
 	if not auto_use_enabled(unit) then
@@ -648,7 +713,9 @@ local function clear_state()
 	autofire_latched = false
 	quell_offense_pause = false
 	quell_replay = nil
-	staff_prev_peril = false
+	fire_prev, fire_climb_t, fire_climb = false, false, 0
+	pending.start_t, pending.until_t, pending_now = false, 0, 0
+	blitz_fire_ts[1], blitz_fire_ts[2], blitz_fire_ts[3] = nil, nil, nil
 	quell_state.hold_timer = 0
 	plasma_vent_state.hold_timer = 0
 	scriers_secs, scriers_prev_peril, scriers_climb = 0, false, 0
@@ -686,7 +753,8 @@ mod.update = function (dt)
 		mod._sc_wield_guard = math.max(0, mod._sc_wield_guard - dt)
 	end
 
-	local category, is_brain_rupture = classify(unit)
+	local category, variant = classify(unit)
+	local is_brain_rupture = variant == "brain_rupture"
 	local is_overheat = category and OVERHEAT_CATEGORIES[category] or false
 
 	-- Plasma runs for any class if either plasma feature is on; Peril weapons are Psyker-only.
@@ -731,18 +799,20 @@ mod.update = function (dt)
 		force_conclude = immune and imm_remaining < ping_lead + CONCLUDE_MARGIN
 	end
 
-	local threshold
-	if is_brain_rupture then
-		-- Safe when locked below 1 - (1 - extreme) x warp_charge_amount. Empowered Psionics casts are free.
-		if EMPOWERED_GRENADE and buff_ext:has_keyword(EMPOWERED_GRENADE) then
-			threshold = math.huge
-		else
-			local stat_buffs = buff_ext:stat_buffs()
-			local warp_charge_amount = (stat_buffs and stat_buffs.warp_charge_amount) or 1
-			threshold = 1 - (1 - BRAIN_RUPTURE_EXTREME) * warp_charge_amount - BRAIN_RUPTURE_HEADROOM
-		end
-	else
-		threshold = CATEGORY_CAP[category] or PERIL_CAP
+	-- Empowered Psionics makes a Brain Rupture or Assail cast free.
+	local empowered = (is_brain_rupture or variant == "assail") and empowered_free(buff_ext)
+	local threshold = PERIL_CAP
+	-- Assail keeps its block armed: block_engaged_now lifts it live while a stack is left.
+	local block_threshold = PERIL_CAP
+	if empowered then
+		threshold = math.huge
+		block_threshold = is_brain_rupture and math.huge or PERIL_CAP
+	elseif is_brain_rupture then
+		-- Safe when locked below 1 - (1 - extreme) x warp_charge_amount.
+		local stat_buffs = buff_ext:stat_buffs()
+		local warp_charge_amount = (stat_buffs and stat_buffs.warp_charge_amount) or 1
+		threshold = 1 - (1 - BRAIN_RUPTURE_EXTREME) * warp_charge_amount - BRAIN_RUPTURE_HEADROOM
+		block_threshold = threshold
 	end
 
 	local at_cap = category ~= nil and not effectively_immune and peril >= threshold
@@ -751,9 +821,9 @@ mod.update = function (dt)
 
 	-- Block armed. The Peril comparison itself runs live on the fixed frame (block_engaged_now).
 	local block_armed = category ~= nil and not effectively_immune and not overloading
-		and cd > cfg.recover_window and block_toggle_for(category)
+		and cd > cfg.recover_window and block_toggle_for(category, variant == "greatsword")
 		and not (crystalline and not cfg.block_crystalline)
-	mod._sc_block_boundary = block_armed and threshold or math.huge
+	mod._sc_block_boundary = block_armed and block_threshold or math.huge
 	mod._sc_block_category = category
 	mod._sc_block_overheat = is_overheat
 	-- Brain Rupture's lock gets its own live check, which skips a running locked cast.
@@ -871,7 +941,127 @@ local function get_input(cache, lookup, name, index)
 	return slot and slot[index]
 end
 
--- Live cap test on the fixed frame, reading the Peril the cast start will snapshot.
+-- Live Peril, or heat for an overheat weapon.
+local function meter(unit_data, overheat)
+	if overheat then
+		local inv = unit_data:read_component("inventory")
+		local slot_name = inv and inv.wielded_slot
+		local slot = slot_name and slot_name ~= "none" and unit_data:read_component(slot_name)
+		return slot and slot.overheat_current_percentage or 0
+	end
+	local warp_charge = unit_data:read_component("warp_charge")
+	return warp_charge and warp_charge.current_percentage or 0
+end
+
+-- Peril one immediate payment adds, as WarpCharge.increase_immediate computes it.
+local function immediate_cost(charge_template, buff_ext, charge_level)
+	local percent = charge_template.warp_charge_percent
+	if type(percent) == "table" then
+		percent = math.max(percent.lerp_basic or 0, percent.lerp_perfect or 0)
+	end
+	if type(percent) ~= "number" then
+		return 0
+	end
+	local stat_buffs = buff_ext:stat_buffs() or EMPTY
+	local scale = (stat_buffs.warp_charge_amount or 1) * (stat_buffs.warp_charge_immediate_amount or 1)
+	if charge_template.psyker_smite then
+		scale = scale * (stat_buffs.psyker_smite_cost_multiplier or 1) * (stat_buffs.warp_charge_amount_smite or 1)
+	end
+	return percent * (charge_template.use_charge and charge_level or 1) * scale
+end
+
+-- Meter per second a charge action adds at its fastest; huge if it cannot be read.
+local function charge_rate(weapon_ext, buff_ext, action, overheat)
+	local charge_template = action and action.charge_template and weapon_ext._weapon_tweak_template
+		and weapon_ext:_weapon_tweak_template("charge", action.charge_template)
+	if not charge_template then
+		return math.huge
+	end
+	local percent = overheat and charge_template.overheat_percent or charge_template.warp_charge_percent
+	local duration = charge_template.charge_duration
+	if type(percent) == "table" then
+		percent = math.max(percent.lerp_basic or 0, percent.lerp_perfect or 0)
+	end
+	if type(duration) == "table" then
+		duration = math.min(duration.lerp_basic or math.huge, duration.lerp_perfect or math.huge)
+	end
+	if type(percent) ~= "number" or type(duration) ~= "number" or duration <= 0 or duration == math.huge then
+		return math.huge
+	end
+	local stat_buffs = buff_ext:stat_buffs() or EMPTY
+	if overheat then
+		return percent / duration * (stat_buffs.overheat_amount or 1) * (stat_buffs.overheat_over_time_amount or 1)
+	end
+	local scale = (stat_buffs.warp_charge_amount or 1) * (stat_buffs.warp_charge_over_time_amount or 1)
+	if charge_template.psyker_smite then
+		scale = scale * (stat_buffs.psyker_smite_cost_multiplier or 1)
+	end
+	return percent / duration * scale
+end
+
+-- Per fixed frame: Peril the running action still owes (pending_now). A projectile pays at its
+-- fire time; a force-sword fling and a blocked parry pay on the server only, so the meter lags
+-- by ping. Also records blitz casts for empowered_free.
+local function track_running_action()
+	pending_now = 0
+	local category = mod._sc_block_category
+	if not category or mod._sc_block_overheat then
+		return
+	end
+	local player = local_player()
+	local unit = player and player.player_unit
+	local unit_data = unit and ALIVE[unit] and ScriptUnit.has_extension(unit, "unit_data_system")
+	local weapon_ext = unit_data and ScriptUnit.has_extension(unit, "weapon_system")
+	local buff_ext = weapon_ext and ScriptUnit.has_extension(unit, "buff_system")
+	if not buff_ext then
+		return
+	end
+	local t = last_fixed_t
+	local weapon_action = unit_data:read_component("weapon_action")
+	local template = weapon_ext:weapon_template()
+	local name = weapon_action and weapon_action.current_action_name
+	local action = name and template and template.actions and template.actions[name]
+	local kind = action and action.charge_template and action.kind
+	local live = meter(unit_data, false)
+	local sync = math.min(last_ping, 1) + SYNC_MARGIN
+	if kind == "spawn_projectile" or kind == "damage_target" or kind == "block" then
+		local start_t = weapon_action.start_t or t
+		local charge_template = weapon_ext:charge_template()
+		if pending.start_t ~= start_t then
+			pending.start_t, pending.base, pending.cost, pending.until_t = start_t, live, 0, 0
+			if kind ~= "block" and category == "blitz" then
+				blitz_fire_ts[3], blitz_fire_ts[2], blitz_fire_ts[1] = blitz_fire_ts[2], blitz_fire_ts[1], start_t
+			end
+			if charge_template and kind == "spawn_projectile" then
+				local charge = action.use_charge and unit_data:read_component("action_module_charge")
+				local game_session = Managers.state.game_session
+				local fixed_dt = game_session and game_session.fixed_time_step or (1 / 52)
+				pending.cost = immediate_cost(charge_template, buff_ext, charge and charge.charge_level or 1)
+				pending.until_t = start_t + (action.fire_time or 0.1) / (weapon_action.time_scale or 1) + 2 * fixed_dt
+			elseif charge_template and kind == "damage_target" and category == "force_sword" then
+				-- A fling with no target pays nothing.
+				local target = unit_data:read_component("action_module_target_finder")
+				if target and target.target_unit_1 then
+					pending.cost = immediate_cost(charge_template, buff_ext, 1)
+					pending.until_t = start_t + (action.pay_warp_charge_time or 0.5) + sync
+				end
+			end
+		end
+		if kind == "block" and charge_template then
+			local block = unit_data:read_component("block")
+			if block and block.has_blocked then
+				pending.cost = immediate_cost(charge_template, buff_ext, 1)
+				pending.until_t = t + sync
+			end
+		end
+	end
+	if t <= pending.until_t then
+		pending_now = math.max(0, pending.base + pending.cost - live)
+	end
+end
+
+-- Live cap test on the fixed frame, reading the Peril the cast start will snapshot plus what the
+-- running action still owes.
 local function block_engaged_now()
 	if mod._sc_block_boundary >= math.huge then
 		return false
@@ -882,24 +1072,22 @@ local function block_engaged_now()
 		return false
 	end
 	-- A mid-hitch swap must not block the new weapon.
-	if classify(unit) ~= mod._sc_block_category then
+	local category, variant = classify(unit)
+	if category ~= mod._sc_block_category then
 		return false
 	end
 	local unit_data = ScriptUnit.has_extension(unit, "unit_data_system")
 	if not unit_data then
 		return false
 	end
-	local peril
-	if mod._sc_block_overheat then
-		local inv = unit_data:read_component("inventory")
-		local slot_name = inv and inv.wielded_slot
-		local slot = slot_name and slot_name ~= "none" and unit_data:read_component(slot_name)
-		peril = slot and slot.overheat_current_percentage or 0
-	else
-		local warp_charge = unit_data:read_component("warp_charge")
-		peril = warp_charge and warp_charge.current_percentage or 0
+	-- An Empowered Psionics Assail throw is free.
+	if variant == "assail" then
+		local buff_ext = ScriptUnit.has_extension(unit, "buff_system")
+		if buff_ext and empowered_free(buff_ext) then
+			return false
+		end
 	end
-	return peril >= mod._sc_block_boundary
+	return meter(unit_data, mod._sc_block_overheat) + pending_now >= mod._sc_block_boundary
 end
 
 -- Whether any of `interrupts` is pressed this frame.
@@ -1100,6 +1288,199 @@ local function push_info(template)
 	return info or nil
 end
 
+-- Last queued weapon action input: the parser listens for that input's children.
+local function last_queued_input(unit)
+	local input_ext = ScriptUnit.has_extension(unit, "action_input_system")
+	local parsers = input_ext and input_ext._action_input_parsers
+	local parser = parsers and parsers.weapon_action
+	local queue = parser and parser._action_input_queue and parser._action_input_queue[parser._ring_buffer_index]
+	local inputs = queue and queue[1]
+	if not inputs then
+		return (input_ext and input_ext:peek_next_input("weapon_action")) or nil
+	end
+	local last = nil
+	for i = 1, parser._MAX_ACTION_INPUT_QUEUE or 0 do
+		local input = inputs[i]
+		if input == nil or input == parser._NO_ACTION_INPUT then
+			break
+		end
+		last = input
+	end
+	return last
+end
+
+-- Charged fire: the game queues the input and snapshots the meter when the fire can start (its
+-- chain gate, or the ready-up after a sprint). Swallows it if the meter is predicted at the cap
+-- by then.
+local function guard_charged_fire(input_cache, lookup, index)
+	local fire_category = mod._sc_block_category
+	local player = FIRE_GUARD[fire_category] and local_player()
+	local unit = player and player.player_unit
+	local unit_data = unit and ALIVE[unit] and classify(unit) == fire_category
+		and ScriptUnit.has_extension(unit, "unit_data_system")
+	if not unit_data then
+		-- A tracking gap invalidates the sample.
+		fire_prev = false
+		return
+	end
+	local overheat = mod._sc_block_overheat
+	local live = meter(unit_data, overheat)
+	local climb = fire_prev and math.max(0, live - fire_prev) or 0
+	fire_prev = live
+	local boundary = mod._sc_block_boundary
+	local wa = unit_data:read_component("weapon_action")
+	local action_name = wa and wa.current_action_name
+	local charging = action_name ~= nil and STAFF_CHARGE_ACTIONS[action_name] or false
+	if charging then
+		if fire_climb_t ~= wa.start_t then
+			fire_climb_t, fire_climb = wa.start_t, 0
+		end
+		fire_climb = math.max(fire_climb, climb)
+	else
+		fire_climb_t = false
+	end
+	local weapon_ext = boundary < math.huge and ScriptUnit.has_extension(unit, "weapon_system")
+	local buff_ext = weapon_ext and ScriptUnit.has_extension(unit, "buff_system")
+	local template = buff_ext and weapon_ext:weapon_template()
+	local actions = template and template.actions
+	if not actions then
+		return
+	end
+	-- The charge that is running, or queued last (the parser already listens for its fire).
+	local charge_name = charging and action_name or nil
+	if not charge_name then
+		local last = last_queued_input(unit)
+		local last_config = last and template.action_inputs and template.action_inputs[last]
+		-- A zero-buffer input that does not start on its own frame expires.
+		if last_config and (last_config.buffer_time or 0) > 0 then
+			for name in pairs(STAFF_CHARGE_ACTIONS) do
+				if actions[name] and actions[name].start_input == last then
+					charge_name = name
+				end
+			end
+		end
+	end
+	local charge = charge_name and actions[charge_name]
+	local chains = charge and charge.allowed_chain_actions
+	local fire, fire_input
+	if chains then
+		for i = 1, #STAFF_FIRE_INPUTS do
+			fire_input = STAFF_FIRE_INPUTS[i]
+			fire = chains[fire_input]
+			if fire then
+				break
+			end
+		end
+	end
+	-- The fire input's raw keys (a press, and for Smite's heavy a hold that completes it), and
+	-- whether the key it must be pressed with is held.
+	local input_config = fire and template.action_inputs and template.action_inputs[fire_input]
+	local sequence = input_config and input_config.input_sequence
+	local triggered, held = false, true
+	if type(sequence) == "table" then
+		for i = 1, #sequence do
+			local raw, hold = sequence[i].input, sequence[i].hold_input
+			if raw and get_input(input_cache, lookup, raw, index) then
+				triggered = true
+			end
+			if type(hold) == "string" and not get_input(input_cache, lookup, hold, index) then
+				held = false
+			end
+		end
+	end
+	if not triggered then
+		-- Hip fire at full heat only forces a vent, but a stun would fire it.
+		if fire_category == "plasma" and not charge_name and live >= boundary - PLASMA_HIP_MARGIN then
+			set_input(input_cache, lookup, "action_one_pressed", index, false)
+		end
+		return
+	end
+	local fire_settings = fire.action_name and actions[fire.action_name]
+	local game_session = Managers.state.game_session
+	local fixed_dt = game_session and game_session.fixed_time_step or (1 / 52)
+	-- last_fixed_t is the previous frame's time.
+	local now = last_fixed_t + fixed_dt
+	local chain_time = fire.chain_time or 0
+	local ready_up = fire_settings and fire_settings.sprint_ready_up_time or 0
+	local sprint = unit_data:read_component("sprint_character_state")
+	local sprinting = sprint ~= nil and Sprint.is_sprinting(sprint)
+	local sprint_blocked = sprinting and fire_settings ~= nil
+		and not fire_settings.allowed_during_sprint and not fire_settings.buff_keywords
+	-- Seconds a sprint that just ended still holds the fire back.
+	local recent = not sprinting and sprint and type(sprint.last_sprint_time) == "number"
+		and math.max(0, sprint.last_sprint_time + ready_up - now) or 0
+	local owed = live + pending_now
+	local swallow = false
+	if not charging then
+		-- Without its hold key the press cannot fire the queued charge.
+		if held and sprint_blocked then
+			-- The sprint may become a jump before the charge starts: unknowable.
+			swallow = true
+		elseif held then
+			-- The climb cannot be measured yet: assume the charge's rate until the gate, or until
+			-- the queued fire's buffer runs out.
+			local span = math.min(chain_time, input_config.buffer_time or 0)
+			-- A sprint or its cooldown keeps the queued fire alive until the gate.
+			if sprinting or recent > 0 or (sprint and type(sprint.cooldown) == "number" and now < sprint.cooldown) then
+				span = math.max(chain_time, ready_up + fixed_dt, recent)
+			end
+			swallow = owed + charge_rate(weapon_ext, buff_ext, charge, overheat) * (span + 2 * fixed_dt) >= boundary
+		end
+	else
+		local elapsed = now - (wa.start_t or now)
+		local wait
+		local sprint_drop = 0
+		if not held then
+			-- The press cannot fire the charge, which climbs until its release is taken.
+			wait = (charge.minimum_hold_time or 0) - elapsed
+		else
+			local ts = wa.time_scale or 1
+			local gate = (ts < 1) and (chain_time * ts) or (chain_time / ts)
+			wait = gate - elapsed
+			if sprint_blocked then
+				local inair = unit_data:read_component("inair_state")
+				if sprint.is_sprinting and not get_input(input_cache, lookup, "jump", index)
+					and (not inair or inair.on_ground) then
+					-- The queued input ends the sprint; the fire starts after its ready-up.
+					wait = math.max(wait, ready_up)
+					sprint_drop = 1
+				else
+					-- A sprint-jump holds the input until landing: unknowable.
+					swallow = true
+				end
+			elseif recent > 0 then
+				wait = math.max(wait, recent)
+			end
+		end
+		if not swallow then
+			-- Frames until the charge stops climbing; a float tie can open the gate a frame late.
+			local frames = math.max(0, math.ceil(wait / fixed_dt - 0.001))
+			if wait > -fixed_dt then
+				frames = math.max(frames, 1)
+			end
+			-- Each further sequence element takes a frame.
+			frames = math.max(frames, #sequence - 1) + sprint_drop
+			if frames == 0 then
+				swallow = owed >= boundary
+			else
+				-- An unmeasured climb (the charge's first frame) falls back to its rate. One
+				-- frame of margin on a prediction.
+				local per_frame = fire_climb > 0 and fire_climb
+					or charge_rate(weapon_ext, buff_ext, charge, overheat) * fixed_dt
+				swallow = owed + per_frame * (frames + 1) >= boundary
+			end
+		end
+	end
+	if swallow then
+		for i = 1, #sequence do
+			local raw = sequence[i].input
+			if raw then
+				set_input(input_cache, lookup, raw, index, false)
+			end
+		end
+	end
+end
+
 local quell_ctx = {}
 
 local function read_quell_ctx()
@@ -1138,6 +1519,7 @@ mod:hook_safe("HumanInputHandler", "_parse_input", function (self, input_cache, 
 		mod._sc_plasma_vent_interrupted = true
 	end
 	mod._sc_cast_held = first_input(input_cache, lookup, index, CAST_HOLDS) ~= nil
+	track_running_action()
 	local block_now = block_engaged_now()
 	if block_now then
 		local pressed = mod._sc_pressed
@@ -1154,68 +1536,7 @@ mod:hook_safe("HumanInputHandler", "_parse_input", function (self, input_cache, 
 			set_input(input_cache, lookup, release[i], index, false)
 		end
 	end
-	-- Staff pre-gate press: the game queues it and snapshots Peril when the fire gate opens.
-	-- Swallow it if Peril is predicted to reach the cap by then.
-	local staff_tracked = false
-	if mod._sc_block_boundary < math.huge and mod._sc_block_category == "staff" then
-		local sp_player = local_player()
-		local sp_unit = sp_player and sp_player.player_unit
-		local sp_ud = sp_unit and ALIVE[sp_unit] and classify(sp_unit) == "staff"
-			and ScriptUnit.has_extension(sp_unit, "unit_data_system")
-		if sp_ud then
-			local warp = sp_ud:read_component("warp_charge")
-			local live = (warp and warp.current_percentage) or 0
-			local climb = staff_prev_peril and math.max(0, live - staff_prev_peril) or 0
-			staff_prev_peril = live
-			staff_tracked = true
-			if get_input(input_cache, lookup, "action_one_pressed", index) then
-				local wa = sp_ud:read_component("weapon_action")
-				local action_name = wa and wa.current_action_name
-				if action_name and STAFF_CHARGE_ACTIONS[action_name] then
-					local weapon_ext = ScriptUnit.has_extension(sp_unit, "weapon_system")
-					local template = weapon_ext and weapon_ext:weapon_template()
-					local actions = template and template.actions
-					local action = actions and actions[action_name]
-					local chains = action and action.allowed_chain_actions
-					local chain_time, fire_settings = 0, nil
-					if chains then
-						for i = 1, #STAFF_FIRE_INPUTS do
-							local fire = chains[STAFF_FIRE_INPUTS[i]]
-							if fire then
-								chain_time = fire.chain_time or 0
-								fire_settings = fire.action_name and actions[fire.action_name]
-								break
-							end
-						end
-					end
-					local sprint_comp = sp_ud:read_component("sprint_character_state")
-					if fire_settings and not fire_settings.allowed_during_sprint
-						and not fire_settings.buff_keywords
-						and sprint_comp and Sprint.is_sprinting(sprint_comp) then
-						-- Sprinting defers Surge's fire indefinitely; swallow the press.
-						set_input(input_cache, lookup, "action_one_pressed", index, false)
-					elseif climb > 0 then
-						-- Time left until the fire gate opens.
-						local ts = wa.time_scale or 1
-						local gate = (ts < 1) and (chain_time * ts) or (chain_time / ts)
-						local remaining = gate - (last_fixed_t - (wa.start_t or last_fixed_t))
-						if remaining > 0 then
-							local fixed_dt = (Managers.state.game_session and Managers.state.game_session.fixed_time_step) or 0.02
-							-- +2 frames of margin.
-							local predicted = live + climb * (remaining / fixed_dt + 2)
-							if predicted >= mod._sc_block_boundary then
-								set_input(input_cache, lookup, "action_one_pressed", index, false)
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-	-- A tracking gap invalidates the sample.
-	if not staff_tracked then
-		staff_prev_peril = false
-	end
+	guard_charged_fire(input_cache, lookup, index)
 	-- Scrier's guard: swallow a staff shot that would end the stance.
 	local guard_tracked = false
 	if mod._sc_scriers_guard then
@@ -1242,8 +1563,7 @@ mod:hook_safe("HumanInputHandler", "_parse_input", function (self, input_cache, 
 	if mod._sc_br_boundary < math.huge then
 		local br_player = local_player()
 		local br_unit = br_player and br_player.player_unit
-		-- classify's 2nd return is the Brain Rupture flag.
-		if br_unit and ALIVE[br_unit] and select(2, classify(br_unit)) then
+		if br_unit and ALIVE[br_unit] and select(2, classify(br_unit)) == "brain_rupture" then
 			local br_ud = ScriptUnit.has_extension(br_unit, "unit_data_system")
 			if br_ud then
 				local weapon_action = br_ud:read_component("weapon_action")
@@ -1363,6 +1683,14 @@ mod:hook_safe("HumanInputHandler", "_parse_input", function (self, input_cache, 
 		elseif not quell_ctx.venting then
 			if not (block_now and raw_is_blocked(quell_replay)) then
 				set_input(input_cache, lookup, quell_replay, index, true)
+				-- A force-sword swing starts on the attack hold, so a tap needs it for one frame.
+				-- Not while blocking: there the tap is a push, which this hold would turn into a swing.
+				if quell_replay == "action_one_pressed" and quell_ctx.category == "force_sword"
+					and not get_input(input_cache, lookup, "action_two_hold", index)
+					and not (block_now and raw_is_blocked("action_one_hold")) then
+					set_input(input_cache, lookup, "action_one_hold", index, true)
+				end
+				guard_charged_fire(input_cache, lookup, index)
 			end
 			quell_replay = nil
 		end

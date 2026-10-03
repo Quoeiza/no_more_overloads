@@ -16,8 +16,8 @@ return {
 						type = "dropdown",
 						default_value = "relaxed",
 						options = {
-							{ text = "opt_blocking_relaxed", value = "relaxed", show_widgets = { 1, 2, 3, 4, 5 } },
-							{ text = "opt_blocking_strict",  value = "strict",  show_widgets = { 1, 2, 3, 4, 5 } },
+							{ text = "opt_blocking_relaxed", value = "relaxed", show_widgets = { 1, 2, 3, 4, 5, 6 } },
+							{ text = "opt_blocking_strict",  value = "strict",  show_widgets = { 1, 2, 3, 4, 5, 6 } },
 						},
 						sub_widgets = {
 							{
@@ -32,6 +32,11 @@ return {
 							},
 							{
 								setting_id = "block_force_swords",
+								type = "checkbox",
+								default_value = true,
+							},
+							{
+								setting_id = "block_force_greatswords",
 								type = "checkbox",
 								default_value = true,
 							},
@@ -83,7 +88,7 @@ return {
 							{
 								setting_id = "auto_quell_interrupt_offensive",
 								type = "checkbox",
-								default_value = false,
+								default_value = true,
 							},
 							{
 								setting_id = "auto_quell_interrupt_other",
