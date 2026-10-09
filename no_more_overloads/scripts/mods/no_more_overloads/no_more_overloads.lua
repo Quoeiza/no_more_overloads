@@ -451,6 +451,8 @@ local pending = { start_t = false, base = 0, cost = 0, until_t = 0 }
 local pending_now = 0
 -- Start times of the last blitz casts that spend an Empowered Psionics stack.
 local blitz_fire_ts = {}
+-- Fixed time until which a swallowed staff charge requests a quell.
+local charge_quell_until = 0
 
 -- Whether an Empowered Psionics stack is certainly unspent: stacks seen here, less the recent
 -- casts whose spent stack may not have reached this client yet.
@@ -716,6 +718,7 @@ local function clear_state()
 	fire_prev, fire_climb_t, fire_climb = false, false, 0
 	pending.start_t, pending.until_t, pending_now = false, 0, 0
 	blitz_fire_ts[1], blitz_fire_ts[2], blitz_fire_ts[3] = nil, nil, nil
+	charge_quell_until = 0
 	quell_state.hold_timer = 0
 	plasma_vent_state.hold_timer = 0
 	scriers_secs, scriers_prev_peril, scriers_climb = 0, false, 0
@@ -886,7 +889,9 @@ mod.update = function (dt)
 		and not (cfg.quell_interrupt_offensive and mod._sc_offense_held) or false
 	local quell_interrupted = mod._sc_quell_interrupted
 	mod._sc_quell_interrupted = false
-	mod._sc_quell = update_vent(quell_state, unsafe or scriers_limit, quell_band, quell_allowed,
+	-- A staff charge swallowed because its fire could never start below the cap.
+	local charge_quell = category == "staff" and last_fixed_t <= charge_quell_until
+	mod._sc_quell = update_vent(quell_state, unsafe or scriers_limit or charge_quell, quell_band, quell_allowed,
 		cfg.quell_interrupt_offensive and mod._sc_offense_held, cfg.auto_quell_hold, quell_interrupted, dt)
 
 	-- Plasma venting: hold the weapon special while UNSAFE.
@@ -970,8 +975,9 @@ local function immediate_cost(charge_template, buff_ext, charge_level)
 	return percent * (charge_template.use_charge and charge_level or 1) * scale
 end
 
--- Meter per second a charge action adds at its fastest; huge if it cannot be read.
-local function charge_rate(weapon_ext, buff_ext, action, overheat)
+-- Meter per second a charge action adds at its fastest; huge if it cannot be read. `full` reads
+-- the slower climb once charge_level reaches 1.
+local function charge_rate(weapon_ext, buff_ext, action, overheat, full)
 	local charge_template = action and action.charge_template and weapon_ext._weapon_tweak_template
 		and weapon_ext:_weapon_tweak_template("charge", action.charge_template)
 	if not charge_template then
@@ -979,6 +985,9 @@ local function charge_rate(weapon_ext, buff_ext, action, overheat)
 	end
 	local percent = overheat and charge_template.overheat_percent or charge_template.warp_charge_percent
 	local duration = charge_template.charge_duration
+	if full and not overheat and type(charge_template.full_charge_warp_charge_percent) == "number" then
+		percent, duration = charge_template.full_charge_warp_charge_percent, 1
+	end
 	if type(percent) == "table" then
 		percent = math.max(percent.lerp_basic or 0, percent.lerp_perfect or 0)
 	end
@@ -1481,6 +1490,131 @@ local function guard_charged_fire(input_cache, lookup, index)
 	end
 end
 
+-- Staff charge: charging never decays Peril, and the fire overloads when it starts at 100%. A
+-- charge whose fire cannot start below the cap is useless: its key is swallowed (or released,
+-- which cancels a running charge on every staff) and a quell requested instead.
+
+-- Raw key a press-or-hold input starts on, or nil.
+local function start_raw(inputs, input_name)
+	local config = input_name and inputs[input_name]
+	local step = config and type(config.input_sequence) == "table" and config.input_sequence[1]
+	return step and step.value == true and step.input or nil
+end
+
+-- Peril when the charge's fire can first start; nil if unreadable. `wa` is the running charge's
+-- weapon_action, or nil for a charge about to start; `full` once its charge_level reached 1.
+local function charge_fire_peril(weapon_ext, buff_ext, charge, owed, wa, full, fixed_dt)
+	local chains = charge.allowed_chain_actions
+	local chain_time
+	for i = 1, #STAFF_FIRE_INPUTS do
+		local fire = chains and chains[STAFF_FIRE_INPUTS[i]]
+		if fire then
+			chain_time = fire.chain_time
+			break
+		end
+	end
+	local rate = charge_rate(weapon_ext, buff_ext, charge, false, full)
+	if type(chain_time) ~= "number" or rate >= math.huge then
+		return nil
+	end
+	local ts = wa and wa.time_scale
+	if not wa then
+		-- The time scale the charge will start with, as the action handler computes it.
+		local handler = weapon_ext._action_handler
+		local ok
+		if handler and handler._calculate_time_scale then
+			ok, ts = pcall(handler._calculate_time_scale, handler, charge)
+		end
+		ts = ok and ts
+	end
+	if type(ts) ~= "number" or ts <= 0 then
+		ts = 1
+	end
+	local gate = (ts < 1 and INVERTED_KINDS[charge.kind]) and chain_time * ts or chain_time / ts
+	-- last_fixed_t is the previous frame's time.
+	local elapsed = wa and (last_fixed_t + fixed_dt - (wa.start_t or last_fixed_t)) or 0
+	local wait = gate - elapsed
+	-- Gate open: the fire starts now. Otherwise the same frame count and margin guard_charged_fire uses.
+	if wait <= -fixed_dt then
+		return owed
+	end
+	local frames = math.max(1, math.ceil(wait / fixed_dt - 0.001))
+	return owed + rate * fixed_dt * (frames + 1)
+end
+
+local function guard_staff_charge(input_cache, lookup, index)
+	local boundary = mod._sc_block_boundary
+	if mod._sc_block_category ~= "staff" or boundary >= math.huge then
+		return
+	end
+	local player = local_player()
+	local unit = player and player.player_unit
+	local unit_data = unit and ALIVE[unit] and classify(unit) == "staff"
+		and ScriptUnit.has_extension(unit, "unit_data_system")
+	local weapon_ext = unit_data and ScriptUnit.has_extension(unit, "weapon_system")
+	local buff_ext = weapon_ext and ScriptUnit.has_extension(unit, "buff_system")
+	local template = buff_ext and weapon_ext:weapon_template()
+	local actions = template and template.actions
+	local inputs = template and template.action_inputs
+	if not actions or not inputs then
+		return
+	end
+	local game_session = Managers.state.game_session
+	local fixed_dt = game_session and game_session.fixed_time_step or (1 / 52)
+	local wa = unit_data:read_component("weapon_action")
+	local current = wa and wa.current_action_name
+	local charge_component = unit_data:read_component("action_module_charge")
+	local charge_level = charge_component and charge_component.charge_level or 0
+	local owed = meter(unit_data, false) + pending_now
+	local swallowed = nil
+	if current and STAFF_CHARGE_ACTIONS[current] then
+		-- A running charge whose fire can no longer start below the cap: release it.
+		local charge = actions[current]
+		local raw = charge and start_raw(inputs, charge.start_input)
+		if raw and get_input(input_cache, lookup, raw, index) then
+			local at = charge_fire_peril(weapon_ext, buff_ext, charge, owed, wa, charge_level >= 1, fixed_dt)
+			if at and at >= boundary then
+				swallowed = raw
+			end
+		end
+	else
+		-- A new charge.
+		local keep = attack_keep(template, current, "staff")
+		for name in pairs(STAFF_CHARGE_ACTIONS) do
+			local charge = actions[name]
+			local raw = charge and start_raw(inputs, charge.start_input)
+			if not swallowed and raw and not (keep and keep[raw]) and get_input(input_cache, lookup, raw, index) then
+				local at = charge_fire_peril(weapon_ext, buff_ext, charge, owed, nil, false, fixed_dt)
+				if at and at >= boundary then
+					swallowed = raw
+				end
+			end
+		end
+		-- The fire chaining back into a charge as its charge runs out (Inferno's keep_charging).
+		-- The fire needs the key until then, so it is released only in the last frames.
+		local action = current and actions[current]
+		local fire_template = action and action.charge_template and weapon_ext:charge_template()
+		local cost = fire_template and type(fire_template.charge_cost) == "number" and fire_template.charge_cost or 0
+		if not swallowed and action and charge_level <= cost * 3 * fixed_dt then
+			for input_name, chain in pairs(action.allowed_chain_actions or EMPTY) do
+				local charge = type(chain) == "table" and chain.running_action_state_requirement
+					and STAFF_CHARGE_ACTIONS[chain.action_name] and actions[chain.action_name]
+				local raw = charge and start_raw(inputs, input_name)
+				if not swallowed and raw and get_input(input_cache, lookup, raw, index) then
+					local at = charge_fire_peril(weapon_ext, buff_ext, charge, owed, nil, false, fixed_dt)
+					if at and at >= boundary then
+						swallowed = raw
+					end
+				end
+			end
+		end
+	end
+	if swallowed then
+		set_input(input_cache, lookup, swallowed, index, false)
+		charge_quell_until = last_fixed_t + 2 * fixed_dt
+	end
+end
+
 local quell_ctx = {}
 
 local function read_quell_ctx()
@@ -1537,6 +1671,8 @@ mod:hook_safe("HumanInputHandler", "_parse_input", function (self, input_cache, 
 		end
 	end
 	guard_charged_fire(input_cache, lookup, index)
+	-- Before the quell reads the cache, so a swallowed charge never pauses it.
+	guard_staff_charge(input_cache, lookup, index)
 	-- Scrier's guard: swallow a staff shot that would end the stance.
 	local guard_tracked = false
 	if mod._sc_scriers_guard then
